@@ -96,7 +96,7 @@ try {
             } catch(e) {}
 
             // Capture all tabs in this Finder window
-            // Finder scripting doesn't directly expose tabs, so we use
+            // Finder scripting does not directly expose tabs, so we use
             // the current target as the primary path and try to detect
             // tab count via System Events UI elements
             const tabs = [{path: path, name: w.name()}];
@@ -286,42 +286,127 @@ JSEOF
     brave_count=$(/usr/bin/python3 -c "import json; print(len(json.loads(open('$tmp_dir/brave.json').read())))")
     echo -e "${GREEN}  ✓ Captured ${brave_count} Brave Browser window(s)${NC}"
 
-    # Capture VS Code windows — get actual workspace/folder paths
+    # Capture VS Code windows using CoreGraphics + VS Code internal state
+    # This avoids System Events Accessibility permission requirements
     echo -e "${BLUE}  → Capturing VS Code windows...${NC}"
 
-    # First, resolve actual open workspace paths from VS Code's internal state
-    # VS Code stores workspace info in ~/Library/Application Support/Code/User/workspaceStorage/
-    local vscode_open_folders
-    vscode_open_folders=$(/usr/bin/python3 << 'VSCPYEOF'
-import json, os, glob, subprocess, urllib.parse
+    python3 - "$tmp_dir" << 'VSCODE_CAPTURE_PY'
+import json, os, sys, subprocess, urllib.parse
 
-results = {}  # title_fragment -> folder_path
+tmp_dir = sys.argv[1]
+windows = []
 
-# Method 1: Read from VS Code's backup workspaces in storage.json
+# --- Step 1: Get VS Code window bounds via CoreGraphics ---
+# CGWindowListCopyWindowInfo works without Accessibility permission
+try:
+    import Quartz
+    all_windows = Quartz.CGWindowListCopyWindowInfo(
+        Quartz.kCGWindowListOptionAll | Quartz.kCGWindowListExcludeDesktopElements,
+        Quartz.kCGNullWindowID
+    )
+    code_pid = None
+    # Find the main Code process PID
+    for w in all_windows:
+        if w.get("kCGWindowOwnerName") == "Code":
+            code_pid = w.get("kCGWindowOwnerPID")
+            break
+
+    if code_pid:
+        # Filter to actual content windows (not toolbars, menubars, popups)
+        # Real VS Code windows have substantial height (> 200px)
+        for w in all_windows:
+            if w.get("kCGWindowOwnerPID") != code_pid:
+                continue
+            if w.get("kCGWindowLayer", -1) != 0:
+                continue
+            bounds = w.get("kCGWindowBounds", {})
+            height = bounds.get("Height", 0)
+            width = bounds.get("Width", 0)
+            # Skip toolbars (< 100px tall), tiny popups, and zero-size windows
+            if height < 200 or width < 200:
+                continue
+            name = w.get("kCGWindowName", "") or ""
+            windows.append({
+                "app": "Visual Studio Code",
+                "name": name,
+                "workspace": "",
+                "bounds": {
+                    "x": int(bounds.get("X", 0)),
+                    "y": int(bounds.get("Y", 0)),
+                    "width": int(width),
+                    "height": int(height)
+                }
+            })
+except ImportError:
+    # Quartz not available — try osascript as fallback
+    try:
+        r = subprocess.run(["osascript", "-l", "JavaScript", "-e", """
+        const windows = [];
+        try {
+            const se = Application("System Events");
+            const p = se.processes.byName("Code");
+            const ws = p.windows();
+            for (let i = 0; i < ws.length; i++) {
+                const w = ws[i];
+                windows.push({
+                    app: "Visual Studio Code",
+                    name: w.title(),
+                    workspace: "",
+                    bounds: {x: w.position()[0], y: w.position()[1], width: w.size()[0], height: w.size()[1]}
+                });
+            }
+        } catch(e) {}
+        JSON.stringify(windows);
+        """], capture_output=True, text=True, timeout=10)
+        if r.stdout.strip():
+            windows = json.loads(r.stdout.strip())
+    except:
+        pass
+
+# --- Step 2: Get workspace info from VS Code internal state ---
+folder_map = {}  # folder_name -> folder_path
+open_workspaces = []  # ordered list of open workspace paths
+
+# Read storage.json for currently open windows
 storage_path = os.path.expanduser("~/Library/Application Support/Code/storage.json")
 if os.path.exists(storage_path):
     try:
         with open(storage_path) as f:
             data = json.load(f)
-        # openedWindows contains currently open windows with their folder URIs
-        opened = data.get("openedWindows", [])
-        for entry in opened:
+        # openedWindows has the currently open windows with folder URIs
+        for entry in data.get("openedWindows", []):
             folder_uri = entry.get("folderUri", "")
+            remote_auth = entry.get("remoteAuthority", "")
             if folder_uri.startswith("file://"):
-                folder_path = urllib.parse.unquote(folder_uri.replace("file://", ""))
-                folder_name = os.path.basename(folder_path)
-                results[folder_name] = folder_path
+                path = urllib.parse.unquote(folder_uri.replace("file://", ""))
+                name = os.path.basename(path)
+                folder_map[name] = path
+                open_workspaces.append({"name": name, "path": path, "remote": ""})
+            elif folder_uri.startswith("vscode-remote://"):
+                # Remote SSH workspace: vscode-remote://ssh-remote+host/path
+                parts = folder_uri.replace("vscode-remote://", "").split("/", 1)
+                if len(parts) >= 2:
+                    path = "/" + parts[1]
+                    name = os.path.basename(path)
+                    folder_map[name] = path
+                    open_workspaces.append({"name": name, "path": path, "remote": remote_auth or parts[0]})
         # Also check lastActiveWindow
         last = data.get("lastActiveWindow", {})
         folder_uri = last.get("folderUri", "")
         if folder_uri.startswith("file://"):
-            folder_path = urllib.parse.unquote(folder_uri.replace("file://", ""))
-            folder_name = os.path.basename(folder_path)
-            results[folder_name] = folder_path
+            path = urllib.parse.unquote(folder_uri.replace("file://", ""))
+            name = os.path.basename(path)
+            folder_map[name] = path
+        elif folder_uri.startswith("vscode-remote://"):
+            parts = folder_uri.replace("vscode-remote://", "").split("/", 1)
+            if len(parts) >= 2:
+                path = "/" + parts[1]
+                name = os.path.basename(path)
+                folder_map[name] = path
     except:
         pass
 
-# Method 2: Scan workspaceStorage for workspace.json files
+# Scan workspaceStorage as additional source
 ws_storage = os.path.expanduser("~/Library/Application Support/Code/User/workspaceStorage")
 if os.path.isdir(ws_storage):
     try:
@@ -333,132 +418,66 @@ if os.path.isdir(ws_storage):
                         ws_data = json.load(f)
                     folder = ws_data.get("folder", "")
                     if folder.startswith("file://"):
-                        folder_path = urllib.parse.unquote(folder.replace("file://", ""))
-                        folder_name = os.path.basename(folder_path)
-                        results[folder_name] = folder_path
+                        path = urllib.parse.unquote(folder.replace("file://", ""))
+                        name = os.path.basename(path)
+                        folder_map[name] = path
+                    elif folder.startswith("vscode-remote://"):
+                        parts = folder.replace("vscode-remote://", "").split("/", 1)
+                        if len(parts) >= 2:
+                            path = "/" + parts[1]
+                            name = os.path.basename(path)
+                            folder_map[name] = path
                 except:
                     pass
     except:
         pass
 
-print(json.dumps(results))
-VSCPYEOF
-    )
-    echo "$vscode_open_folders" > "$tmp_dir/vscode_folder_map.json"
-
-    local vscode_windows
-    vscode_windows=$(osascript -l JavaScript << 'JSEOF'
-const windows = [];
-try {
-    const se = Application("System Events");
-    const proc = se.processes.byName("Code");
-    const vsWindows = proc.windows();
-    for (let i = 0; i < vsWindows.length; i++) {
-        const w = vsWindows[i];
-        try {
-            const pos = w.position();
-            const sz = w.size();
-            const title = w.title();
-            // Extract workspace/folder from VS Code window title
-            // Typical format: "filename — foldername — Visual Studio Code"
-            let workspace = "";
-            if (title.includes(" — ")) {
-                const parts = title.split(" — ");
-                if (parts.length >= 2) {
-                    workspace = parts[parts.length - 2];
-                }
-            }
-            windows.push({
-                app: "Visual Studio Code",
-                name: title,
-                workspace: workspace,
-                bounds: {
-                    x: pos[0],
-                    y: pos[1],
-                    width: sz[0],
-                    height: sz[1]
-                }
-            });
-        } catch(e2) {}
-    }
-} catch(e) {}
-JSON.stringify(windows);
-JSEOF
-    )
-
-    # Enrich VS Code windows with actual folder paths
-    /usr/bin/python3 << VSCENRICH
-import json, os
-try:
-    with open("$tmp_dir/vscode.json.tmp", "w") as _: pass  # ensure file exists
-    folder_map = json.loads(open("$tmp_dir/vscode_folder_map.json").read())
-    windows = json.loads('''PLACEHOLDER''')
-except:
-    windows = []
-    folder_map = {}
-VSCENRICH
-
-    # Use Python to safely enrich (avoiding quote issues)
-    echo "$vscode_windows" > "$tmp_dir/vscode_raw.json"
-    /usr/bin/python3 << 'VSCENRICH2'
-import json, os
-
-tmp_dir = os.environ.get("TMPDIR_LAYOUT", "")
-if not tmp_dir:
-    # Find it from the raw json path
-    import sys
-    sys.exit(0)
-VSCENRICH2
-
-    # Safer approach: use python with file paths only
-    /usr/bin/python3 - "$tmp_dir" << 'ENRICH_PY'
-import json, os, sys
-
-tmp_dir = sys.argv[1]
-try:
-    with open(os.path.join(tmp_dir, "vscode_raw.json")) as f:
-        windows = json.loads(f.read())
-    with open(os.path.join(tmp_dir, "vscode_folder_map.json")) as f:
-        folder_map = json.loads(f.read())
-
-    # Match each window's workspace name to a real folder path
-    for w in windows:
-        ws_name = w.get("workspace", "")
-        if ws_name and ws_name in folder_map:
-            w["workspacePath"] = folder_map[ws_name]
-        elif ws_name:
-            # Try case-insensitive match
-            for key, path in folder_map.items():
-                if key.lower() == ws_name.lower():
-                    w["workspacePath"] = path
-                    break
-            # Try matching against folder basename
-            if "workspacePath" not in w:
+# --- Step 3: Enrich windows with workspace info ---
+# Try to extract workspace from window title (if Screen Recording gave us titles)
+for w in windows:
+    title = w.get("name", "")
+    if title and " \u2014 " in title:
+        parts = title.split(" \u2014 ")
+        if len(parts) >= 2:
+            ws = parts[-2].strip()
+            # Strip SSH suffix like "[SSH: hostname]"
+            import re
+            ws = re.sub(r"\s*\[SSH:.*?\]\s*$", "", ws)
+            w["workspace"] = ws
+            if ws in folder_map:
+                w["workspacePath"] = folder_map[ws]
+            else:
                 for key, path in folder_map.items():
-                    if os.path.basename(path).lower() == ws_name.lower():
+                    if key.lower() == ws.lower() or os.path.basename(path).lower() == ws.lower():
                         w["workspacePath"] = path
                         break
 
-    with open(os.path.join(tmp_dir, "vscode_enriched.json"), "w") as f:
-        json.dump(windows, f)
-except Exception as e:
-    # Fallback: just use the raw data
-    import shutil
-    src = os.path.join(tmp_dir, "vscode_raw.json")
-    dst = os.path.join(tmp_dir, "vscode_enriched.json")
-    if os.path.exists(src):
-        shutil.copy(src, dst)
-ENRICH_PY
+# If titles are empty (no Screen Recording), match windows to open workspaces by count
+if windows and all(not w.get("name") for w in windows):
+    if len(open_workspaces) == len(windows):
+        for w, ws_info in zip(windows, open_workspaces):
+            w["workspace"] = ws_info["name"]
+            w["workspacePath"] = ws_info["path"]
+            if ws_info.get("remote"):
+                w["remote"] = ws_info["remote"]
+    elif open_workspaces:
+        # Best effort: assign what we can
+        for i, w in enumerate(windows):
+            if i < len(open_workspaces):
+                w["workspace"] = open_workspaces[i]["name"]
+                w["workspacePath"] = open_workspaces[i]["path"]
+                if open_workspaces[i].get("remote"):
+                    w["remote"] = open_workspaces[i]["remote"]
 
-    # Use the enriched version
-    if [[ -f "$tmp_dir/vscode_enriched.json" ]]; then
-        cp "$tmp_dir/vscode_enriched.json" "$tmp_dir/vscode.json"
-    else
-        echo "$vscode_windows" > "$tmp_dir/vscode.json"
-    fi
-    echo "$vscode_windows" > "$tmp_dir/vscode.json"
+# Write folder map and final windows
+with open(os.path.join(tmp_dir, "vscode_folder_map.json"), "w") as f:
+    json.dump(folder_map, f)
+with open(os.path.join(tmp_dir, "vscode.json"), "w") as f:
+    json.dump(windows, f)
+VSCODE_CAPTURE_PY
+
     local vscode_count
-    vscode_count=$(/usr/bin/python3 -c "import json; print(len(json.loads(open('$tmp_dir/vscode.json').read())))")
+    vscode_count=$(/usr/bin/python3 -c "import json; print(len(json.loads(open('$tmp_dir/vscode.json').read())))" 2>/dev/null || echo "0")
     echo -e "${GREEN}  ✓ Captured ${vscode_count} VS Code window(s)${NC}"
 
     # Capture Preview (PDF viewer) windows
@@ -844,12 +863,11 @@ if brave_windows:
     time.sleep(1)
 
     for idx, bw in enumerate(brave_windows):
-        b = bw.get("boundsRaw", bw.get("bounds", {}))
         tabs = bw.get("tabs", [])
         active_idx = bw.get("activeTabIndex", 1)
 
         if idx == 0 and tabs:
-            # Use existing window, navigate first tab
+            # Use the existing frontmost window for the first saved window
             first_url = tabs[0].get("url", "about:blank")
             run_jxa(f'''
             const brave = Application("Brave Browser");
@@ -857,25 +875,6 @@ if brave_windows:
             w.activeTab.url = "{first_url}";
             ''')
             time.sleep(0.3)
-            # Open remaining tabs
-            for t_idx, tab in enumerate(tabs[1:], 1):
-                url = tab.get("url", "about:blank")
-                run_jxa(f'''
-                const brave = Application("Brave Browser");
-                const w = brave.windows[0];
-                brave.Tab({{url: "{url}"}}).make({{at: w}});
-                ''')
-                time.sleep(0.2)
-        elif idx > 0 and tabs:
-            # New window with first tab URL
-            first_url = tabs[0].get("url", "about:blank") if tabs else "about:blank"
-            run_jxa(f'''
-            const brave = Application("Brave Browser");
-            brave.Window().make();
-            const w = brave.windows[0];
-            w.activeTab.url = "{first_url}";
-            ''')
-            time.sleep(0.5)
             for tab in tabs[1:]:
                 url = tab.get("url", "about:blank")
                 run_jxa(f'''
@@ -884,29 +883,52 @@ if brave_windows:
                 brave.Tab({{url: "{url}"}}).make({{at: w}});
                 ''')
                 time.sleep(0.2)
+        elif tabs:
+            # Create a new window for each additional saved window
+            first_url = tabs[0].get("url", "about:blank")
+            run_jxa(f'''
+            const brave = Application("Brave Browser");
+            brave.Window().make();
+            brave.windows[0].activeTab.url = "{first_url}";
+            ''')
+            time.sleep(0.5)
+            # Add remaining tabs to this new window (which is now windows[0])
+            for tab in tabs[1:]:
+                url = tab.get("url", "about:blank")
+                run_jxa(f'''
+                const brave = Application("Brave Browser");
+                brave.Tab({{url: "{url}"}}).make({{at: brave.windows[0]}});
+                ''')
+                time.sleep(0.2)
 
-        # Set window bounds
+        # Position this window — it is always windows[0] (frontmost) right now
+        # Use AppleScript bounds format: {left, top, right, bottom}
         if "boundsRaw" in bw:
             br = bw["boundsRaw"]
             run_osascript(f'''
             tell application "Brave Browser"
-                set bounds of window {idx + 1} to {{{br.get("x",0)}, {br.get("y",0)}, {br.get("width",800)}, {br.get("height",600)}}}
+                set bounds of window 1 to {{{br.get("x",0)}, {br.get("y",0)}, {br.get("width",800)}, {br.get("height",600)}}}
             end tell
             ''')
         else:
             bnd = bw.get("bounds", {})
             run_osascript(f'''
             tell application "Brave Browser"
-                set bounds of window {idx + 1} to {{{bnd.get("x",0)}, {bnd.get("y",0)}, {bnd.get("x",0) + bnd.get("width",800)}, {bnd.get("y",0) + bnd.get("height",600)}}}
+                set bounds of window 1 to {{{bnd.get("x",0)}, {bnd.get("y",0)}, {bnd.get("x",0) + bnd.get("width",800)}, {bnd.get("y",0) + bnd.get("height",600)}}}
             end tell
             ''')
 
-        # Set active tab
+        # Set active tab on this window (still frontmost = window 1 / windows[0])
         if active_idx and active_idx > 0:
             run_jxa(f'''
             const brave = Application("Brave Browser");
-            brave.windows[{idx}].activeTabIndex = {active_idx};
+            brave.windows[0].activeTabIndex = {active_idx};
             ''')
+
+        # Brief pause, then move on to next window
+        # The next iteration creates a NEW window which becomes windows[0],
+        # pushing this one to windows[1], etc. So each iteration always
+        # works on windows[0].
         time.sleep(0.3)
     print("  ✓ Brave Browser windows restored")
 
@@ -1161,6 +1183,7 @@ usage() {
     echo -e "Save and restore your multi-monitor window layouts."
     echo ""
     echo -e "${BOLD}Usage:${NC}"
+    echo -e "  layout                                       Interactive mode"
     echo -e "  layout save <name> [--desc \"description\"]   Save current layout"
     echo -e "  layout restore <name>                        Restore a saved layout"
     echo -e "  layout list                                  List all saved layouts"
@@ -1168,13 +1191,216 @@ usage() {
     echo -e "  layout delete <name>                         Delete a saved layout"
     echo -e "  layout screens                               Show current displays"
     echo ""
-    echo -e "${BOLD}Examples:${NC}"
-    echo -e "  layout save isaac-sim-3screen --desc \"Isaac Sim dev on library 3-screen setup\""
-    echo -e "  layout save comp-arch-revision --desc \"40005 Computer Architecture study\""
-    echo -e "  layout save calculus-study --desc \"Calculus revision with notes\""
-    echo -e "  layout restore isaac-sim-3screen"
-    echo -e "  layout list"
+    echo -e "Run ${BOLD}layout${NC} with no arguments for interactive mode."
 }
+
+# ============================================================================
+# INTERACTIVE: REPL mode when run with no arguments
+# ============================================================================
+do_interactive() {
+    clear
+    echo -e "${BOLD}┌─────────────────────────────────────────┐${NC}"
+    echo -e "${BOLD}│   Workspace Layout Manager              │${NC}"
+    echo -e "${BOLD}└─────────────────────────────────────────┘${NC}"
+    echo ""
+
+    # Show current screens
+    local screen_count
+    screen_count=$(/usr/bin/python3 -c "
+import subprocess, json
+r = subprocess.run(['system_profiler', 'SPDisplaysDataType', '-json'], capture_output=True, text=True)
+data = json.loads(r.stdout)
+count = 0
+for gpu in data.get('SPDisplaysDataType', []):
+    count += len(gpu.get('spdisplays_ndrvs', []))
+print(count)
+" 2>/dev/null || echo "?")
+    echo -e "  ${CYAN}Screens:${NC} ${screen_count} connected"
+    echo ""
+
+    # Show saved layouts as numbered list
+    _list_numbered
+
+    echo ""
+    echo -e "  ${BOLD}Commands:${NC}"
+    echo -e "    ${GREEN}save${NC} <name> [desc]     Save current layout"
+    echo -e "    ${GREEN}restore${NC} <name|#>       Restore a layout (by name or number)"
+    echo -e "    ${GREEN}info${NC} <name|#>          Show layout details"
+    echo -e "    ${GREEN}delete${NC} <name|#>        Delete a layout"
+    echo -e "    ${GREEN}screens${NC}                Show display info"
+    echo -e "    ${GREEN}list${NC}                   Refresh layout list"
+    echo -e "    ${GREEN}help${NC}                   Show commands"
+    echo -e "    ${GREEN}quit${NC} / ${GREEN}q${NC} / ${GREEN}Ctrl-C${NC}      Exit"
+    echo ""
+
+    # REPL loop
+    while true; do
+        echo -ne "${BOLD}layout>${NC} "
+        read -r line || { echo ""; break; }  # handle Ctrl-D
+
+        # Trim whitespace
+        line=$(echo "$line" | xargs 2>/dev/null || echo "$line")
+        [[ -z "$line" ]] && continue
+
+        # Parse command and arguments
+        local cmd arg1 arg_rest
+        cmd=$(echo "$line" | awk '{print $1}')
+        arg1=$(echo "$line" | awk '{print $2}')
+        arg_rest=$(echo "$line" | sed 's/^[^ ]* *[^ ]* *//')
+
+        case "$cmd" in
+            save|s)
+                if [[ -z "$arg1" ]]; then
+                    echo -ne "  Layout name: "
+                    read -r arg1
+                    [[ -z "$arg1" ]] && { echo -e "  ${RED}Cancelled.${NC}"; continue; }
+                    echo -ne "  Description (optional): "
+                    read -r arg_rest
+                fi
+                echo ""
+                do_save "$arg1" "$arg_rest"
+                echo ""
+                ;;
+            restore|r)
+                local target
+                target=$(_resolve_name "$arg1")
+                if [[ -z "$target" ]]; then
+                    echo -e "  ${RED}Layout not found.${NC}"
+                    continue
+                fi
+                echo ""
+                do_restore "$target"
+                echo ""
+                ;;
+            info|i)
+                local target
+                target=$(_resolve_name "$arg1")
+                if [[ -z "$target" ]]; then
+                    echo -e "  ${RED}Layout not found.${NC}"
+                    continue
+                fi
+                echo ""
+                do_info "$target"
+                echo ""
+                ;;
+            delete|rm|d)
+                local target
+                target=$(_resolve_name "$arg1")
+                if [[ -z "$target" ]]; then
+                    echo -e "  ${RED}Layout not found.${NC}"
+                    continue
+                fi
+                echo -ne "  ${YELLOW}Delete '${target}'? [y/N]:${NC} "
+                read -r confirm
+                if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+                    do_delete "$target"
+                else
+                    echo -e "  Cancelled."
+                fi
+                echo ""
+                ;;
+            screens|displays)
+                echo ""
+                do_screens
+                echo ""
+                ;;
+            list|ls|l)
+                echo ""
+                _list_numbered
+                echo ""
+                ;;
+            help|h|?)
+                echo ""
+                echo -e "  ${BOLD}Commands:${NC}"
+                echo -e "    ${GREEN}save${NC} <name> [desc]     Save current layout"
+                echo -e "    ${GREEN}restore${NC} <name|#>       Restore a layout (by name or number)"
+                echo -e "    ${GREEN}info${NC} <name|#>          Show layout details"
+                echo -e "    ${GREEN}delete${NC} <name|#>        Delete a layout"
+                echo -e "    ${GREEN}screens${NC}                Show display info"
+                echo -e "    ${GREEN}list${NC}                   Refresh layout list"
+                echo -e "    ${GREEN}quit${NC} / ${GREEN}q${NC} / ${GREEN}Ctrl-C${NC}      Exit"
+                echo ""
+                echo -e "  Tip: Use a number instead of a name (e.g. ${BOLD}restore 1${NC})"
+                echo ""
+                ;;
+            quit|q|exit)
+                echo -e "  ${CYAN}Bye!${NC}"
+                exit 0
+                ;;
+            *)
+                echo -e "  ${RED}Unknown command:${NC} $cmd (type ${BOLD}help${NC} for commands)"
+                ;;
+        esac
+    done
+}
+
+# Print numbered list of saved layouts. Also populates _LAYOUT_NAMES array.
+_LAYOUT_NAMES=()
+_list_numbered() {
+    _LAYOUT_NAMES=()
+    local idx=0
+
+    echo -e "  ${CYAN}Saved Layouts:${NC}"
+
+    for f in "$LAYOUT_DIR"/*.json; do
+        [[ -f "$f" ]] || continue
+        idx=$((idx + 1))
+
+        local entry
+        entry=$(/usr/bin/python3 << PYEOF
+import json, os
+idx = $idx
+with open("$f") as fh:
+    layout = json.loads(fh.read())
+name = layout.get("name", os.path.basename("$f").replace(".json",""))
+desc = layout.get("description", "")
+saved = layout.get("savedAt", "unknown")[:19].replace("T", " ")
+screens = layout.get("screenCount", "?")
+total = sum(len(v) for v in layout.get("windows", {}).values())
+desc_part = f"  {desc}" if desc else ""
+print(f"  \033[1m{idx}.\033[0m {name}{desc_part}")
+print(f"     {total} windows, {screens} screen(s), saved {saved}")
+PYEOF
+)
+        local layout_name
+        layout_name=$(basename "$f" .json)
+        _LAYOUT_NAMES+=("$layout_name")
+        echo "$entry"
+    done
+
+    if [[ $idx -eq 0 ]]; then
+        echo -e "    ${YELLOW}(none yet)${NC} -- use ${BOLD}save <name>${NC} to create one"
+    fi
+}
+
+# Resolve a name or number to a layout name
+_resolve_name() {
+    local input="$1"
+    [[ -z "$input" ]] && { echo ""; return; }
+
+    # If it is a number, look up from _LAYOUT_NAMES
+    if [[ "$input" =~ ^[0-9]+$ ]]; then
+        local idx=$((input - 1))
+        if [[ $idx -ge 0 && $idx -lt ${#_LAYOUT_NAMES[@]} ]]; then
+            echo "${_LAYOUT_NAMES[$idx]}"
+            return
+        else
+            echo ""
+            return
+        fi
+    fi
+
+    # Otherwise treat as a name — check if file exists
+    if [[ -f "${LAYOUT_DIR}/${input}.json" ]]; then
+        echo "$input"
+    else
+        echo ""
+    fi
+}
+
+# ============================================================================
+# MAIN: Parse arguments and dispatch
+# ============================================================================
 
 case "${1:-}" in
     save)
@@ -1202,6 +1428,9 @@ case "${1:-}" in
         ;;
     screens|displays)
         do_screens
+        ;;
+    "")
+        do_interactive
         ;;
     *)
         usage

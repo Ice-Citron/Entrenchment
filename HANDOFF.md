@@ -8,284 +8,169 @@ The idea: run `layout save isaac-sim-3screen`, arrange your windows, and later r
 
 ---
 
-## Current State of the Code
+## Current State (as of 2026-03-25)
+
+### What Works
+- **Save**: Captures Finder, iTerm2, Brave Browser, VS Code, Preview window positions across multiple monitors
+- **VS Code capture**: Now uses CoreGraphics (CGWindowListCopyWindowInfo via pyobjc) to get window bounds + reads VS Code's internal `storage.json` for workspace paths. Handles Remote SSH workspaces (`vscode-remote://` URIs). Falls back to System Events if Quartz unavailable.
+- **Interactive mode**: Running `layout` with no args enters a REPL with numbered layouts, commands, and number-based selection
+- **List/Info/Delete/Screens**: All working
+- **Brave save**: Captures all tabs + URLs across multiple windows
+- **Syntax**: All known parse errors fixed (the `doesn't` apostrophe bug, dead code removed, line 459 overwrite bug fixed)
+
+### What Does NOT Work (restore bugs)
+
+**Tested 2026-03-25 — restore is unreliable. These are the priority bugs:**
+
+1. **Brave Browser restore opens wrong tabs / wrong window**: User had 4 Brave windows with tab groups. After closing one window (containing a "994" tab group with 4-5 tabs) and restoring, a new window opened but with a random AWS page instead of the correct tab group tabs. **Root cause**: The restore logic uses `brave.windows[0]` (frontmost) which shifts as windows are created. Tab-to-window assignment gets scrambled when some windows already exist. Also, Brave tab groups cannot be programmatically recreated (Chromium limitation) — individual tabs restore but lose their group membership.
+
+2. **Preview restores in wrong position / not fullscreen**: User had a fullscreen Preview window showing `ros2_graph`. After closing and restoring, it opened but NOT fullscreen and in the wrong position. **Root cause**: The save captures `bounds` and `boundsRaw` but fullscreen state is not captured. macOS fullscreen is a separate window mode (not just large bounds). The restore uses `set bounds` which only works for normal windows, not fullscreen ones.
+
+3. **Windows App (Microsoft Remote Desktop) does not restore at all**: After closing the RDP session and restoring, the Windows App didn't reopen. **Root cause**: The script captures RDP window positions but the restore likely fails because: (a) the app name changed from "Microsoft Remote Desktop" to "Windows App" at some point and the script may not handle both, (b) RDP connections require authentication/session state that can't be scripted via AppleScript.
+
+4. **VS Code reopened unnecessarily**: VS Code windows that were already open got reopened/duplicated during restore. **Root cause**: Restore doesn't check if an app's windows are already open before creating new ones. Needs a `--clean` flag or smart diffing.
+
+5. **iTerm window running the restore gets killed**: The terminal window executing `layout restore` gets repositioned/killed by the restore process since it's restoring iTerm windows. **Root cause**: The restore recreates/repositions all iTerm windows including the one running the restore. Fix: detect and skip the current terminal window.
+
+---
+
+## Architecture
 
 ### File Structure
-
 ```
-workspace-layout-manager/
-├── layout              # macOS bash script (main tool) — MOSTLY WORKING, has bugs
-├── install.sh          # macOS installer — copies to ~/.local/bin, adds to PATH
-├── README.md           # Documentation
-├── push-to-github.sh   # Helper script to push to Ice-Citron/Entrenchment on GitHub
+Entrenchment/
+├── .gitignore
+├── LICENSE             # MIT
+├── README.md
 ├── HANDOFF.md          # This file
+├── layout              # macOS bash script (main tool)
+├── install.sh          # macOS installer — copies to ~/.local/bin
 └── windows/
-    ├── layout.ps1      # Windows PowerShell script — UNTESTED, written but not run yet
-    ├── layout.bat      # Windows batch launcher (calls layout.ps1)
+    ├── layout.ps1      # Windows PowerShell — UNTESTED
+    ├── layout.bat      # Batch launcher
     └── install.bat     # Windows installer
 ```
 
-### GitHub Repo
+### Save Flow (macOS)
+1. Creates temp directory for intermediate JSON files
+2. Captures each app category separately:
+   - **Finder**: JXA via `Application("Finder")` — direct scripting, no special permissions
+   - **iTerm2**: JXA via `Application("iTerm2")` — direct scripting
+   - **Brave**: JXA via `Application("Brave Browser")` — direct scripting for tabs/URLs
+   - **VS Code**: Python with `Quartz.CGWindowListCopyWindowInfo` for bounds + `storage.json` for workspace paths. Falls back to System Events (needs Accessibility permission)
+   - **Preview**: JXA via `Application("Preview")` — direct scripting
+   - **RDP**: System Events (tries "Microsoft Remote Desktop" and "Windows App")
+   - **Other apps**: System Events enumeration
+3. Python assembler reads all temp files and writes final JSON to `~/.config/workspace-layouts/<name>.json`
 
-- Repo: `https://github.com/Ice-Citron/Entrenchment` (public, MIT license)
-- Currently only has `.gitignore`, `LICENSE`, and a stub `README.md` on `main`
-- The workspace-layout-manager code has NOT been pushed yet
-- The user started setting up git locally at `~/Black_Projects/Entrenchment` but didn't finish
+### Restore Flow (macOS)
+1. Reads saved JSON
+2. Single Python heredoc handles all restore logic
+3. For each app: launches it, uses `osascript` subprocess calls to position windows
 
-### Where the files live on disk
+### Permission Model
+| App | Capture Method | Permission Needed |
+|-----|---------------|-------------------|
+| Finder, iTerm, Brave, Preview | Direct JXA (`Application("AppName")`) | Automation: iTerm → each app |
+| VS Code | CoreGraphics (CGWindowListCopyWindowInfo) | None (bounds only). Screen Recording for window titles |
+| RDP, Other apps | System Events | Accessibility for osascript/iTerm |
 
-- **macOS source**: `/Users/administrator/Black_Projects/Entrenchment/workspace-layout-manager/`
-- **Layouts are saved to**: `~/.config/workspace-layouts/<name>.json`
-- **Install location**: `~/.local/bin/layout`
-
----
-
-## macOS Script (`layout`) — Detailed Technical Notes
-
-### Architecture
-
-The script is a single bash file that dispatches on subcommands: `save`, `restore`, `list`, `info`, `delete`, `screens`.
-
-**Save flow:**
-1. Creates a temp directory for intermediate JSON files (to avoid shell quoting issues)
-2. Runs separate JXA (JavaScript for Automation) `osascript` calls to capture each app category
-3. Each capture writes JSON to a temp file (e.g., `$tmp_dir/finder.json`)
-4. A final Python script reads all temp files and assembles the full layout JSON
-5. Saves to `~/.config/workspace-layouts/<name>.json`
-
-**Restore flow:**
-1. Reads the saved JSON
-2. A single large Python heredoc handles all restore logic
-3. For each app category, it launches the app and uses `osascript` subprocess calls to position windows
-
-### What's captured per app
-
-| App | What's saved | How |
-|-----|-------------|-----|
-| **Finder** | Window positions, folder path of active tab, tab count + tab names via System Events UI inspection | JXA: `Application("Finder").finderWindows()` + System Events `tabGroups` |
-| **iTerm2** | Window positions + bounds, per-tab working directory (via `lsof` on the tty) | JXA: `Application("iTerm2")` scripting API |
-| **Brave Browser** | Window positions + bounds, all tab URLs + titles, active tab index, tab group metadata from Preferences file | JXA: `Application("Brave Browser")` + Python reading `~/Library/Application Support/BraveSoftware/Brave-Browser/Default/Preferences` |
-| **VS Code** | Window positions, workspace name from title bar, enriched with actual folder path from VS Code's `storage.json` and `workspaceStorage/` | System Events for positions + Python reading `~/Library/Application Support/Code/storage.json` and `~/Library/Application Support/Code/User/workspaceStorage/*/workspace.json` |
-| **Preview** | Window positions, document file path | JXA: `Application("Preview")` |
-| **Microsoft Remote Desktop** | Window positions, window title (connection name) | System Events (tries both "Microsoft Remote Desktop" and "Windows App" process names) |
-| **Other apps** | Window positions for any visible non-system app | System Events: enumerates all `backgroundOnly: false` processes, skips known system processes |
-
-### Known Bugs & Issues
-
-1. **JSON parsing crash on save (FIXED but verify)**: The original version injected captured JSON into Python via `'''$variable'''` triple-quote strings. Any single quotes in window titles or file paths broke it. Fixed by writing each capture to temp files instead. The user confirmed the original bug; the fix has been applied but may not have been re-tested.
-
-2. **VS Code enrichment has dead code**: Lines ~390-411 in the `layout` script contain two Python heredocs (`VSCENRICH` and `VSCENRICH2`) that don't actually do anything useful — they were intermediate attempts. The actual working enrichment is the `ENRICH_PY` heredoc on line ~414. The dead code should be removed.
-
-3. **Line 459 overwrites enriched data**: After the enrichment logic carefully writes `vscode_enriched.json` and copies it to `vscode.json`, line 459 does `echo "$vscode_windows" > "$tmp_dir/vscode.json"` which **overwrites the enriched version with the raw version**. This line should be deleted.
-
-4. **Brave tab groups are metadata-only**: We read tab group names/colors from the Preferences file, but there's no way to know which tab belongs to which group via AppleScript. On restore, tabs reopen but aren't re-grouped. This is a Chromium API limitation. The `braveTabGroups` field is saved in the layout JSON but not used during restore.
-
-5. **Finder tabs are partially captured**: We detect tab count and tab names via System Events UI elements, but we only get the **active tab's folder path**. The other tabs' paths aren't accessible via the Finder scripting API. On restore, only one tab (the active one) gets its correct path.
-
-6. **iTerm bounds format inconsistency**: iTerm's `bounds()` returns `{x, y, width, height}` where width/height are actually `right` and `bottom` coordinates (not width/height). The save code tries to handle this with `boundsRaw` vs computed `bounds`, but the restore code's handling of this is fragile. Need to verify the coordinate math is correct.
-
-7. **Restore doesn't close existing windows first** (except Finder): If you have windows already open when you restore, you'll get duplicates on top of the restored ones. Should probably add an option like `--clean` to close existing windows before restoring.
-
-8. **`set -euo pipefail` may cause silent failures**: If any osascript call fails (e.g., an app isn't running), the whole script exits. The `set -e` is fine for the main flow but may need more careful error handling around optional captures (e.g., Preview might not be open).
-
-### Layout JSON Schema
-
-```json
-{
-  "name": "isaac-sim-3screen",
-  "description": "Isaac Sim dev on library 3-screen setup",
-  "savedAt": "2026-03-25T13:45:00.000000",
-  "screenCount": 3,
-  "screens": [
-    {
-      "index": 0,
-      "x": 0, "y": 0,
-      "width": 1440, "height": 900,
-      "visibleX": 0, "visibleY": 25,
-      "visibleWidth": 1440, "visibleHeight": 850
-    }
-  ],
-  "windows": {
-    "finder": [
-      {
-        "app": "Finder",
-        "name": "Documents",
-        "path": "/Users/administrator/Documents",
-        "tabs": [{"path": "/Users/administrator/Documents", "name": "Documents", "tabCount": 3, "tabNames": ["Documents", "Downloads", "Desktop"]}],
-        "bounds": {"x": 0, "y": 23, "width": 800, "height": 600}
-      }
-    ],
-    "iterm": [
-      {
-        "app": "iTerm2",
-        "name": "window title",
-        "bounds": {"x": 0, "y": 0, "width": 800, "height": 400},
-        "boundsRaw": {"x": 0, "y": 0, "width": 800, "height": 400},
-        "tabs": [
-          {
-            "name": "tab name",
-            "sessions": [
-              {"name": "session", "profileName": "Default", "cwd": "/Users/administrator/Projects/isaac-sim"}
-            ]
-          }
-        ]
-      }
-    ],
-    "brave": [
-      {
-        "app": "Brave Browser",
-        "name": "window name",
-        "bounds": {"x": 0, "y": 0, "width": 1200, "height": 800},
-        "boundsRaw": {"x": 0, "y": 0, "width": 1200, "height": 800},
-        "tabs": [
-          {"title": "Google", "url": "https://google.com", "index": 0}
-        ],
-        "activeTabIndex": 1
-      }
-    ],
-    "vscode": [
-      {
-        "app": "Visual Studio Code",
-        "name": "main.py — Project-Automaton — Visual Studio Code",
-        "workspace": "Project-Automaton",
-        "workspacePath": "/Users/administrator/Projects/Project-Automaton",
-        "bounds": {"x": 100, "y": 50, "width": 1000, "height": 700}
-      }
-    ],
-    "preview": [
-      {
-        "app": "Preview",
-        "name": "lecture-notes.pdf",
-        "path": "/Users/administrator/Documents/40005/lecture-notes.pdf",
-        "bounds": {"x": 0, "y": 0, "width": 600, "height": 800},
-        "boundsRaw": {"x": 0, "y": 0, "width": 600, "height": 800}
-      }
-    ],
-    "rdp": [
-      {
-        "app": "Microsoft Remote Desktop",
-        "name": "StarForge-PC",
-        "bounds": {"x": 1440, "y": 0, "width": 1920, "height": 1080}
-      }
-    ],
-    "other": [
-      {
-        "app": "Some App",
-        "name": "window title",
-        "bounds": {"x": 0, "y": 0, "width": 500, "height": 400}
-      }
-    ]
-  },
-  "vscodeRecentWorkspaces": ["/Users/administrator/Projects/Project-Automaton", "..."],
-  "braveTabGroups": [{"id": "abc123", "title": "Research", "color": 1}]
-}
-```
+### Key Design Constraints
+- **Single bash file, no package manager dependencies**: Just bash + osascript + python3 (+ pyobjc for VS Code via conda)
+- **Temp files for JSON assembly**: Never inject JSON into Python heredocs via shell variables (quotes break it)
+- **Best-effort capture**: Failed captures for optional apps should not crash the save
+- **JXA over AppleScript**: JXA has native JSON support
 
 ---
 
-## Windows Script (`layout.ps1`) — Detailed Technical Notes
+## Known Bugs & Issues (Full List)
 
-### Architecture
+### Critical (Restore is Broken)
 
-PowerShell script with `Add-Type` inline C# for Win32 API access. Same subcommand pattern as macOS: `save`, `restore`, `list`, `info`, `delete`, `screens`.
+1. **Brave multi-window restore assigns tabs to wrong windows**: When restoring multiple Brave windows, the `windows[0]` (frontmost) index shifts as new windows are created. Tabs end up in the wrong window. Need to track windows by ID or use a more robust targeting strategy.
 
-**Key technical approach:**
-- Uses `EnumWindows` + `GetWindowRect` + `GetWindowThreadProcessId` via P/Invoke to enumerate all visible windows
-- Uses `Shell.Application` COM object to get Explorer folder paths (matched to windows by HWND)
-- Reads VS Code workspace paths from `%APPDATA%\Code\storage.json` and `%APPDATA%\Code\User\workspaceStorage\`
-- Reads Brave tab group metadata from `%LOCALAPPDATA%\BraveSoftware\Brave-Browser\Default\Preferences`
-- Uses `MoveWindow` to reposition windows on restore
+2. **Brave tab groups not recreatable**: Chromium has no API to programmatically create tab groups. We save group metadata (`braveTabGroups`) but can't use it during restore. Tabs lose their group membership.
 
-### What's captured
+3. **No fullscreen state capture/restore**: Preview (and any other app) in fullscreen can't be restored to fullscreen. `set bounds` only works for normal window mode. Need to detect fullscreen state during save and use `keystroke "f" using {control down, command down}` or similar during restore.
 
-| App | What's saved |
-|-----|-------------|
-| **Explorer** | Window positions, folder paths (via Shell.Application COM) |
-| **Brave/Chrome/Edge** | Window positions (tab URLs NOT captured yet — see TODO) |
-| **VS Code** | Window positions, workspace name from title, actual folder path from internal state |
-| **PowerShell/cmd/Terminal** | Window positions, process name |
-| **Other apps** | Window positions, process name, executable path |
+4. **RDP/Windows App doesn't restore**: App name may have changed. Also RDP sessions can't be reconnected via AppleScript — would need to use `open rdp://` URI or similar.
 
-### Status: COMPLETELY UNTESTED
+5. **Restore duplicates already-open windows**: If an app is already running with windows open, restore adds more on top instead of repositioning existing ones. Need either a `--clean` flag to close existing windows first, or smart matching to reuse existing windows.
 
-This script was written but has never been run. It will almost certainly have bugs. The C# interop code compiles fine in theory but needs real testing on Windows. The user's RDP machines would be the test environment.
+6. **Restore kills the terminal running the command**: The iTerm window executing `layout restore` gets caught in the iTerm restore logic. Need to detect the current terminal PID/window and skip it.
 
-### Known Gaps vs macOS Script
+### Medium
 
-1. **Browser tabs not captured via scripting**: Unlike macOS where AppleScript can enumerate Brave tabs, on Windows there's no equivalent COM/API to get browser tab URLs. Would need to either:
-   - Read from Brave's Session file (`%LOCALAPPDATA%\BraveSoftware\Brave-Browser\Default\Sessions\`) — binary format, very fragile
-   - Use Chrome DevTools Protocol (start Brave with `--remote-debugging-port=9222`) — more reliable but requires browser restart
-   - Use a browser extension that exposes tab data
+7. **`set -euo pipefail` can crash the whole save**: If any optional osascript call fails (e.g., Preview not running), the script exits. Each capture section should trap errors gracefully.
 
-2. **Terminal working directories not captured**: The script captures terminal window positions but not which directory each PowerShell/cmd instance is `cd`'d into. Could potentially use `Get-CimInstance Win32_Process` to get the command line and infer the working directory.
+8. **iTerm bounds format inconsistency**: iTerm's `bounds()` returns `{x, y, right, bottom}` not `{x, y, width, height}`. The `boundsRaw` vs `bounds` handling during save/restore may have incorrect coordinate math.
 
-3. **No equivalent of macOS Accessibility API**: Windows has UI Automation but it's more complex. The current approach (Win32 EnumWindows) gets positions but can't read internal app state the way macOS System Events can.
+9. **Finder tabs partially captured**: Only the active tab's folder path is captured. Other tabs' paths aren't accessible via the Finder scripting API.
+
+10. **VS Code workspace matching is heuristic**: When CGWindowList returns windows without titles (no Screen Recording permission), we match windows to workspaces by count/order, which can be wrong if VS Code has utility windows.
+
+### Low
+
+11. **Windows script completely untested**: `layout.ps1` was written but never run on a real Windows machine.
+
+12. **No `layout diff` command**: Can't compare current state to a saved layout.
+
+13. **No `layout auto` mode**: Can't auto-detect screen count and restore the matching layout.
+
+14. **No Safari support**: Some users might want Safari tab capture.
 
 ---
 
 ## What Needs To Be Done
 
-### Priority 1: Fix macOS bugs
+### Priority 1: Fix Restore (it's the core feature)
 
-- [ ] Remove dead code (the two useless Python heredocs `VSCENRICH` and `VSCENRICH2` around lines 390-411)
-- [ ] Delete line 459 that overwrites enriched VS Code data with raw data
-- [ ] Verify the JSON parsing fix actually works (the temp-file approach replacing the triple-quote injection)
-- [ ] Handle `set -euo pipefail` gracefully — apps that aren't running shouldn't crash the whole save
-- [ ] Test and fix iTerm bounds coordinate math
-- [ ] Test save + restore end-to-end on the user's actual multi-monitor setup
+- [ ] **Fix Brave multi-window restore**: After creating each window, immediately set its bounds before creating the next. Or use a different strategy: close all Brave windows first, then create them one by one with the correct tabs.
+- [ ] **Add fullscreen detection to save and fullscreen restoration**: Check `AXFullScreen` attribute during save, use keyboard shortcut to toggle fullscreen during restore.
+- [ ] **Fix restore duplication**: Add `--clean` flag that closes existing windows before restoring. Or implement smart matching (compare existing windows to saved state, reposition instead of recreate).
+- [ ] **Skip the terminal running the restore**: Detect current iTerm window by PID or tty and exclude it from restore.
+- [ ] **Fix RDP restore**: Check both "Microsoft Remote Desktop" and "Windows App" process names. For reconnecting, try `open rdp://` or just position existing windows.
+- [ ] **Handle `set -euo pipefail` gracefully**: Wrap each app's capture in a subshell or use `|| true` for optional captures.
 
-### Priority 2: Test and fix Windows script
+### Priority 2: Improve Save Accuracy
 
-- [ ] Run `layout.ps1` on a Windows machine (user has RDP access)
-- [ ] Fix any C# compilation or runtime errors
-- [ ] Verify Explorer path matching works
-- [ ] Verify VS Code workspace detection works
-- [ ] Test window repositioning with `MoveWindow`
+- [ ] **Grant Screen Recording permission** so CGWindowList returns VS Code window titles (better workspace matching)
+- [ ] **Fix iTerm bounds coordinate math**: Verify and document the coordinate format
+- [ ] **Capture all Finder tab paths** (not just active tab)
 
-### Priority 3: Feature improvements
+### Priority 3: Test Windows Script
 
-- [ ] Add `--clean` flag to restore that closes existing windows first
-- [ ] Capture browser tabs on Windows (Chrome DevTools Protocol or session file parsing)
-- [ ] Capture terminal working directories on Windows
-- [ ] Capture ALL Finder tab paths on macOS (not just the active tab)
-- [ ] Add support for Safari (some users might use it)
-- [ ] Consider adding a `layout diff <name>` command to see what changed
-- [ ] Consider adding a `layout auto` mode that detects screen count and auto-restores the right layout
+- [ ] Run `layout.ps1` on a Windows machine via RDP
+- [ ] Fix C# compilation/runtime errors
+- [ ] Verify Explorer path matching, VS Code workspace detection, MoveWindow
 
-### Priority 4: Push to GitHub
+### Priority 4: Features
 
-- [ ] Init git repo at `~/Black_Projects/Entrenchment`
-- [ ] Add `.gitignore` (include `.DS_Store`, `*.json` in the layouts config dir, etc.)
-- [ ] Push to `https://github.com/Ice-Citron/Entrenchment.git` under `workspace-layout-manager/`
-- [ ] Update root README
+- [ ] `--clean` flag for restore
+- [ ] `layout diff <name>` command
+- [ ] `layout auto` mode (detect screen count → auto-restore matching layout)
 
 ---
 
-## User Context
+## End Goal
 
-- **Machine**: MacBook Pro (hostname: StarForge-MacBook-Pro), username: `administrator`
-- **Shell**: zsh (with conda base environment active)
-- **Key apps**: iTerm2, Brave Browser, VS Code, Finder, Preview, Microsoft Remote Desktop
-- **Monitor setups**: 3 screens at Imperial College library, 4 screens at Sherfield building
-- **Common contexts to save**:
-  - `isaac-sim-3screen` / `isaac-sim-4screen` — NVIDIA Isaac Sim / Project-Automaton development
-  - `comp-arch-study` — Module 40005 Computer Architecture revision
-  - Various other courses: calculus, assembly, Kotlin
-- **RDP**: User connects to Windows machines via Microsoft Remote Desktop. The Windows `layout.ps1` is meant to run INSIDE the RDP session to capture/restore the remote desktop's window layout.
-- **GitHub**: Username `Ice-Citron`
+The tool should work like this:
+
+1. **At the library (3 screens)**: Run `layout save isaac-sim-3screen`. All windows — VS Code with Project-Automaton, multiple Brave windows with research tabs grouped by topic, iTerm with dev sessions, Finder with project folders, Preview with lecture PDFs, RDP to StarForge-PC — are captured.
+
+2. **Switch to revision mode**: Run `layout restore comp-arch-study`. All Isaac Sim windows close, and the revision layout opens: VS Code with course materials, Brave with lecture slides and reference docs, iTerm with assignment directories, Preview with past papers.
+
+3. **Move to Sherfield (4 screens)**: Run `layout save comp-arch-4screen` to capture the 4-screen arrangement. Later, `layout restore comp-arch-4screen` puts everything back.
+
+4. **On Windows (via RDP)**: Same workflow inside the RDP session using `layout.ps1`.
+
+The key is **reliability** — restore must put windows back exactly where they were, handle edge cases (apps already open, fullscreen, missing apps), and not destroy the user's current state.
 
 ---
 
-## Key Design Decisions Made
+## GitHub
 
-1. **Single bash script, no dependencies**: The macOS tool is one file with no npm/pip/brew dependencies — just bash + osascript + python3 (which ships with macOS).
-
-2. **JSON storage**: Layouts are human-readable JSON files in `~/.config/workspace-layouts/`. Easy to inspect, edit, back up, or sync across machines.
-
-3. **Temp files for JSON assembly**: After hitting a bug where shell variable interpolation broke JSON parsing (quotes in window titles), we switched to writing each capture to a temp file and having Python read from files. This is the correct approach — do NOT go back to injecting JSON into heredocs.
-
-4. **JXA over AppleScript**: Most capture code uses JavaScript for Automation (JXA) rather than AppleScript because JXA has native JSON support and is easier to work with programmatically.
-
-5. **Best-effort capture**: The tool captures what it can and silently skips what it can't. A failed Preview capture shouldn't prevent Finder and iTerm from being saved.
-
-6. **Cross-platform parity**: Both scripts save to the same `~/.config/workspace-layouts/` directory with compatible JSON schemas. A layout saved on macOS won't restore on Windows (different apps/coordinates), but the tooling is consistent.
+- Repo: `https://github.com/Ice-Citron/Entrenchment`
+- Remote: `origin` pointing to above
+- Branch: `main`
+- Last push: 2026-03-25 (repo restructured, files at root)

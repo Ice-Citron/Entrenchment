@@ -1,5 +1,7 @@
 # Workspace Layout Manager
 
+> **Under active development.** Save works reasonably well. Restore has known bugs — windows may open in wrong positions, tabs may end up in the wrong browser window, and fullscreen state is not preserved. See [HANDOFF.md](HANDOFF.md) for the full bug list and roadmap.
+
 Save and restore your multi-monitor window layouts with a single command. Stop dragging windows back into place every time you switch between project contexts.
 
 ## Why?
@@ -8,8 +10,9 @@ If you work across multiple monitors and switch between tasks (robotics dev on o
 
 ## Status
 
-- **macOS** (`layout`): Working, actively used. Has some known issues (see [HANDOFF.md](HANDOFF.md)).
-- **Windows** (`layout.ps1`): Written but **untested**. Needs real-world testing on Windows.
+- **macOS save**: Working. Captures Finder, iTerm2, Brave Browser, VS Code (including Remote SSH), Preview.
+- **macOS restore**: Partially working. Has bugs with multi-window Brave, fullscreen apps, and window duplication. See [HANDOFF.md](HANDOFF.md).
+- **Windows** (`layout.ps1`): Written but **completely untested**.
 
 ## Supported Features
 
